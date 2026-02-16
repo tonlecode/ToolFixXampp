@@ -5,12 +5,14 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 SYSTEM_DBS = {"mysql", "performance_schema", "phpmyadmin", "sys", "test"}
+REQUIRED_SYSTEM_DB_DIRS = {"mysql", "performance_schema", "phpmyadmin"}
 MYSQL_TRANSIENT_EXACT = {"aria_log_control", "ibtmp1", "tc.log"}
 MYSQL_TRANSIENT_PREFIXES = ("aria_log", "ib_logfile")
 MYSQL_CRASH_PATTERNS = (
@@ -271,6 +273,25 @@ def kill_pid(pid: int) -> Tuple[bool, str]:
     return ok, output.strip()
 
 
+def try_mysqladmin_shutdown(mysql_bin_dir: Path, mysql_port: int) -> Tuple[bool, str]:
+    mysqladmin = mysql_bin_dir / "mysqladmin.exe"
+    if not mysqladmin.exists():
+        return False, f"mysqladmin not found: {mysqladmin}"
+
+    attempts = [
+        f'"{mysqladmin}" -u root -P {mysql_port} shutdown',
+        f'"{mysqladmin}" --protocol=tcp -h 127.0.0.1 -u root -P {mysql_port} shutdown',
+    ]
+
+    for cmd in attempts:
+        result = run(cmd, timeout=20)
+        output = ((result.stdout or "") + (result.stderr or "")).strip()
+        if result.returncode == 0:
+            return True, output or "mysqladmin shutdown succeeded."
+
+    return False, output or "mysqladmin shutdown failed."
+
+
 def patch_mysql_port(mysql_ini: Path, old_port: int, new_port: int, ctx: Context, report: List[str]) -> bool:
     if not mysql_ini.exists():
         report.append(f"MySQL config not found: {mysql_ini}")
@@ -453,6 +474,14 @@ def cleanup_mysql_transient_logs(data_dir: Path, dry_run: bool) -> List[str]:
     return sorted(set(removed))
 
 
+def mysql_data_structure_status(data_dir: Path) -> Tuple[bool, List[str]]:
+    missing: List[str] = []
+    for name in sorted(REQUIRED_SYSTEM_DB_DIRS):
+        if not (data_dir / name).is_dir():
+            missing.append(name)
+    return len(missing) == 0, missing
+
+
 def copy_user_dbs(old_data: Path, new_data: Path, dry_run: bool) -> List[str]:
     copied: List[str] = []
     for db_dir in list_user_databases(old_data):
@@ -477,6 +506,26 @@ def copy_optional_mysql_files(old_data: Path, new_data: Path, dry_run: bool) -> 
                 shutil.copy2(src, dst)
 
     return copied
+
+
+def choose_recovery_source(mysql_dir: Path, primary_old_data: Path) -> Path:
+    candidates: List[Path] = [primary_old_data]
+    historical = sorted(
+        [p for p in mysql_dir.glob("data_old_*") if p.is_dir() and p != primary_old_data],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    candidates.extend(historical)
+
+    for candidate in candidates:
+        if list_user_databases(candidate):
+            return candidate
+
+    for candidate in candidates:
+        if (candidate / "mysql").is_dir():
+            return candidate
+
+    return primary_old_data
 
 
 def read_recent_mysql_errors(data_dir: Path, lines: int = 250) -> Tuple[Optional[Path], str]:
@@ -535,14 +584,17 @@ def safe_mysql_data_rebuild(ctx: Context, report: List[str]) -> bool:
     try:
         shutil.move(str(ctx.mysql_data), str(data_old))
         shutil.copytree(ctx.mysql_backup_template, ctx.mysql_data)
-        copied_dbs = copy_user_dbs(data_old, ctx.mysql_data, dry_run=False)
-        copied_files = copy_optional_mysql_files(data_old, ctx.mysql_data, dry_run=False)
+        donor_data = choose_recovery_source(ctx.mysql_dir, data_old)
+        copied_dbs = copy_user_dbs(donor_data, ctx.mysql_data, dry_run=False)
+        copied_files = copy_optional_mysql_files(donor_data, ctx.mysql_data, dry_run=False)
         removed_logs = cleanup_mysql_transient_logs(ctx.mysql_data, dry_run=False)
     except Exception as exc:
         report.append(f"MySQL data rebuild failed: {exc}")
         return False
 
     report.append(f"Data backup kept at: {data_old}")
+    if donor_data != data_old:
+        report.append(f"Recovery source selected from historical backup: {donor_data}")
     report.append(f"Copied DB folders: {copied_dbs if copied_dbs else '(none)'}")
     report.append(f"Copied core files: {copied_files if copied_files else '(none)'}")
     report.append(f"Removed transient logs: {removed_logs if removed_logs else '(none)'}")
@@ -643,8 +695,16 @@ def main() -> int:
     if not args.skip_mysql:
         mysql_port = parse_mysql_port(ctx.mysql_ini, default=3306)
         print(f"[MySQL] Configured port: {mysql_port}")
-        owners = owners_for_port(mysql_port, port_map, process_map)
-        mysql_running = any("mysqld" in o.process_name.lower() for o in owners)
+
+        def refresh_mysql_state() -> Tuple[List[PortOwner], bool]:
+            nonlocal process_map, port_map, mysql_port
+            process_map = get_process_table()
+            port_map = get_listening_ports()
+            current_owners = owners_for_port(mysql_port, port_map, process_map)
+            current_running = any("mysqld" in o.process_name.lower() for o in current_owners)
+            return current_owners, current_running
+
+        owners, mysql_running = refresh_mysql_state()
 
         if owners:
             owner_text = ", ".join(f"{o.process_name}(PID {o.pid})" for o in owners)
@@ -659,7 +719,7 @@ def main() -> int:
                         result_text = "OK" if ok else "FAILED"
                         print(f"[MySQL] taskkill PID {owner.pid}: {result_text}")
                         report.append(f"MySQL port blocker PID {owner.pid} kill: {result_text}; {output}")
-                    port_map = get_listening_ports()
+                    owners, mysql_running = refresh_mysql_state()
                 elif args.no_port_remap:
                     print("[MySQL] Conflict detected. No auto action because --no-port-remap is active.")
                     report.append("MySQL conflict detected but remap disabled.")
@@ -674,6 +734,7 @@ def main() -> int:
                             patch_phpmyadmin_port(ctx.phpmyadmin_config, new_port, ctx, report)
                             print(f"[MySQL] Port remapped: {mysql_port} -> {new_port}")
                             mysql_port = new_port
+                            owners, mysql_running = refresh_mysql_state()
         else:
             print(f"[MySQL] Port {mysql_port} is free.")
             report.append(f"MySQL port {mysql_port} is free.")
@@ -681,18 +742,57 @@ def main() -> int:
         rebuild_needed = False
         rebuild_reason = ""
         crash_signal, log_file, patterns = detect_mysql_crash_signal(ctx.mysql_data)
+        structure_ok, missing_system_dirs = mysql_data_structure_status(ctx.mysql_data)
+
+        if not structure_ok:
+            missing_text = ", ".join(missing_system_dirs)
+            print(f"[MySQL] Warning: data dir missing system folders: {missing_text}")
+            report.append(f"MySQL data structure warning: missing system folders -> {missing_text}")
 
         if args.mysql_repair_mode == "always":
             rebuild_needed = True
             rebuild_reason = "forced by --mysql-repair-mode always"
-        elif args.mysql_repair_mode == "auto" and crash_signal and not mysql_running:
-            rebuild_needed = True
-            rebuild_reason = f"detected crash signals in {log_file}: {patterns}"
+        elif args.mysql_repair_mode == "auto":
+            auto_reasons: List[str] = []
+            if crash_signal:
+                auto_reasons.append(f"detected crash signals in {log_file}: {patterns}")
+            if not structure_ok:
+                auto_reasons.append(f"missing system folders in data dir: {missing_system_dirs}")
+            if auto_reasons and not mysql_running:
+                rebuild_needed = True
+                rebuild_reason = "; ".join(auto_reasons)
 
-        if crash_signal and mysql_running and args.mysql_repair_mode == "auto":
+        if args.mysql_repair_mode == "auto" and mysql_running and (crash_signal or not structure_ok):
             report.append(
-                "Crash signal detected, but mysqld is still running; skipped auto rebuild to avoid live-data changes."
+                "Crash/data-structure signal detected, but mysqld is running; auto rebuild skipped to avoid live-data changes."
             )
+
+        if rebuild_needed and mysql_running:
+            if not ctx.dry_run:
+                print("[MySQL] Trying graceful shutdown via mysqladmin before rebuild...")
+                ok, output = try_mysqladmin_shutdown(ctx.mysql_dir / "bin", mysql_port)
+                print(f"[MySQL] mysqladmin shutdown: {'OK' if ok else 'FAILED'}")
+                report.append(f"mysqladmin shutdown before rebuild: {'OK' if ok else 'FAILED'}; {output}")
+                if ok:
+                    time.sleep(1)
+                    owners, mysql_running = refresh_mysql_state()
+
+            if args.auto_kill and not ctx.dry_run:
+                print("[MySQL] Trying to stop running mysqld before rebuild...")
+                report.append("Trying to stop mysqld before rebuild.")
+                for owner in owners:
+                    if "mysqld" not in owner.process_name.lower():
+                        continue
+                    ok, output = kill_pid(owner.pid)
+                    print(f"[MySQL] taskkill PID {owner.pid}: {'OK' if ok else 'FAILED'}")
+                    report.append(f"Stop mysqld PID {owner.pid}: {'OK' if ok else 'FAILED'}; {output}")
+                time.sleep(1)
+                owners, mysql_running = refresh_mysql_state()
+
+            if mysql_running:
+                print("[MySQL] Rebuild blocked: mysqld is still running on configured port.")
+                report.append("MySQL rebuild blocked because mysqld is still running.")
+                rebuild_needed = False
 
         if rebuild_needed:
             print(f"[MySQL] Data rebuild candidate: {rebuild_reason}")

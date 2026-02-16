@@ -5,46 +5,43 @@ import sys
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import List
 from tkinter import filedialog, messagebox
 import tkinter as tk
 from tkinter import ttk
 
+try:
+    import fix as fix_core
+except Exception:
+    fix_core = None
+
 
 class ToolFixUI(tk.Tk):
-    def __init__(self) -> None:
+    def __init__(self):
         super().__init__()
-        self.title("ToolFix XAMPP - Modern UI")
-        self.geometry("1180x760")
+        self.title("ToolFix XAMPP - Smart One-Click UI")
+        self.geometry("1160x760")
         self.minsize(980, 640)
 
         self.colors = {
             "bg": "#F4F7FB",
             "surface": "#FFFFFF",
-            "surface_soft": "#EDF2F7",
+            "surface_soft": "#EEF3F8",
             "text": "#0F172A",
             "muted": "#475569",
             "accent": "#0284C7",
             "accent_dark": "#0369A1",
             "danger": "#BE123C",
-            "warning": "#B45309",
-            "success": "#047857",
             "border": "#D8E2EE",
         }
 
         self.fix_script = Path(__file__).with_name("fix.py")
         self.proc = None
-        self.read_thread = None
+        self.worker_thread = None
+        self.stop_requested = threading.Event()
         self.log_queue = queue.Queue()
         self.last_report_path = None
 
         self.path_var = tk.StringVar(value=self._detect_default_xampp())
-        self.mode_var = tk.StringVar(value="auto")
-        self.dry_run_var = tk.BooleanVar(value=True)
-        self.auto_kill_var = tk.BooleanVar(value=False)
-        self.no_remap_var = tk.BooleanVar(value=False)
-        self.skip_apache_var = tk.BooleanVar(value=False)
-        self.skip_mysql_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Ready")
 
         self._configure_theme()
@@ -52,7 +49,7 @@ class ToolFixUI(tk.Tk):
         self.after(120, self._drain_log_queue)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    def _configure_theme(self) -> None:
+    def _configure_theme(self):
         self.configure(bg=self.colors["bg"])
         style = ttk.Style(self)
         style.theme_use("clam")
@@ -67,12 +64,12 @@ class ToolFixUI(tk.Tk):
 
         style.configure(
             "Primary.TButton",
-            font=("Segoe UI Semibold", 10),
+            font=("Segoe UI Semibold", 11),
             foreground="#FFFFFF",
             background=self.colors["accent"],
             borderwidth=0,
             focusthickness=0,
-            padding=(14, 9),
+            padding=(16, 11),
         )
         style.map(
             "Primary.TButton",
@@ -86,7 +83,7 @@ class ToolFixUI(tk.Tk):
             background=self.colors["danger"],
             borderwidth=0,
             focusthickness=0,
-            padding=(14, 9),
+            padding=(12, 9),
         )
         style.map(
             "Danger.TButton",
@@ -107,24 +104,7 @@ class ToolFixUI(tk.Tk):
             background=[("active", "#E2E8F0")],
         )
 
-        style.configure(
-            "Switch.TCheckbutton",
-            background=self.colors["surface"],
-            foreground=self.colors["text"],
-            font=("Segoe UI", 9),
-        )
-
-        style.configure(
-            "ToolFix.TCombobox",
-            fieldbackground="#FFFFFF",
-            background="#FFFFFF",
-            foreground=self.colors["text"],
-            borderwidth=1,
-            arrowsize=15,
-            padding=(6, 4),
-        )
-
-    def _build_layout(self) -> None:
+    def _build_layout(self):
         root = ttk.Frame(self, style="Root.TFrame", padding=18)
         root.pack(fill="both", expand=True)
         root.columnconfigure(0, weight=1)
@@ -137,12 +117,13 @@ class ToolFixUI(tk.Tk):
         ttk.Label(header, text="ToolFix XAMPP", style="Title.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(
             header,
-            text="Modern control panel for diagnose, safe repair, and live logs",
+            text="One-click smart recovery for Apache/MySQL with safe backups",
             style="Subtitle.TLabel",
         ).grid(row=1, column=0, sticky="w")
+
         badge = tk.Label(
             header,
-            text="SAFE-FIRST",
+            text="AUTO MODE",
             bg="#E0F2FE",
             fg=self.colors["accent_dark"],
             font=("Segoe UI Semibold", 9),
@@ -151,20 +132,21 @@ class ToolFixUI(tk.Tk):
         )
         badge.grid(row=0, column=1, rowspan=2, sticky="e")
 
-        controls = ttk.Frame(root, style="Card.TFrame", padding=14)
-        controls.grid(row=1, column=0, sticky="ew", pady=(0, 12))
-        controls.columnconfigure(1, weight=1)
-        controls.columnconfigure(3, weight=1)
-        self._card_border(controls)
+        settings = ttk.Frame(root, style="Card.TFrame", padding=14)
+        settings.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+        settings.columnconfigure(1, weight=1)
+        settings.columnconfigure(2, weight=0)
 
-        ttk.Label(controls, text="Settings", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(controls, text="Configure options then run one of the actions.", style="CardBody.TLabel").grid(
-            row=1, column=0, columnspan=4, sticky="w", pady=(0, 10)
-        )
+        ttk.Label(settings, text="Settings", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            settings,
+            text="Set XAMPP path and press one button. ToolFix will diagnose and repair automatically.",
+            style="CardBody.TLabel",
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 10))
 
-        ttk.Label(controls, text="XAMPP Path", style="CardBody.TLabel").grid(row=2, column=0, sticky="w", pady=(0, 6))
-        path_entry = tk.Entry(
-            controls,
+        ttk.Label(settings, text="XAMPP Path", style="CardBody.TLabel").grid(row=2, column=0, sticky="w", pady=(0, 6))
+        self.path_entry = tk.Entry(
+            settings,
             textvariable=self.path_var,
             font=("Segoe UI", 10),
             bg="#FFFFFF",
@@ -176,84 +158,47 @@ class ToolFixUI(tk.Tk):
             highlightcolor=self.colors["accent"],
             bd=0,
         )
-        path_entry.grid(row=2, column=1, columnspan=2, sticky="ew", padx=(8, 8), pady=(0, 6), ipady=6)
-        ttk.Button(controls, text="Browse", style="Ghost.TButton", command=self._browse_path).grid(
-            row=2, column=3, sticky="ew", pady=(0, 6)
-        )
-
-        ttk.Label(controls, text="MySQL Repair Mode", style="CardBody.TLabel").grid(row=3, column=0, sticky="w")
-        repair_combo = ttk.Combobox(
-            controls,
-            style="ToolFix.TCombobox",
-            textvariable=self.mode_var,
-            values=("auto", "always", "never"),
-            state="readonly",
-            width=18,
-        )
-        repair_combo.grid(row=3, column=1, sticky="w", padx=(8, 12), pady=(2, 8))
-
-        toggles = ttk.Frame(controls, style="Card.TFrame")
-        toggles.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(0, 4))
-        for idx in range(3):
-            toggles.columnconfigure(idx, weight=1)
-
-        ttk.Checkbutton(toggles, text="Dry Run", variable=self.dry_run_var, style="Switch.TCheckbutton").grid(
-            row=0, column=0, sticky="w", pady=2
-        )
-        ttk.Checkbutton(toggles, text="Auto Kill Port Blockers", variable=self.auto_kill_var, style="Switch.TCheckbutton").grid(
-            row=0, column=1, sticky="w", pady=2
-        )
-        ttk.Checkbutton(toggles, text="Disable Port Remap", variable=self.no_remap_var, style="Switch.TCheckbutton").grid(
-            row=0, column=2, sticky="w", pady=2
-        )
-        ttk.Checkbutton(toggles, text="Skip Apache", variable=self.skip_apache_var, style="Switch.TCheckbutton").grid(
-            row=1, column=0, sticky="w", pady=2
-        )
-        ttk.Checkbutton(toggles, text="Skip MySQL", variable=self.skip_mysql_var, style="Switch.TCheckbutton").grid(
-            row=1, column=1, sticky="w", pady=2
-        )
+        self.path_entry.grid(row=2, column=1, sticky="ew", padx=(8, 8), pady=(0, 6), ipady=6)
+        self.browse_button = ttk.Button(settings, text="Browse", style="Ghost.TButton", command=self._browse_path)
+        self.browse_button.grid(row=2, column=2, sticky="ew", pady=(0, 6))
 
         actions = ttk.Frame(root, style="Card.TFrame", padding=14)
         actions.grid(row=2, column=0, sticky="ew", pady=(0, 12))
-        actions.columnconfigure(0, weight=1)
+        actions.columnconfigure(0, weight=3)
         actions.columnconfigure(1, weight=1)
-        actions.columnconfigure(2, weight=1)
-        actions.columnconfigure(3, weight=1)
-        actions.columnconfigure(4, weight=1)
-        self._card_border(actions)
 
-        ttk.Label(actions, text="Actions", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(actions, text="Recommended flow: Diagnose -> Safe Repair -> Deep Repair (only if needed)", style="CardBody.TLabel").grid(
-            row=1, column=0, columnspan=5, sticky="w", pady=(0, 10)
+        ttk.Label(actions, text="One-Click Action", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            actions,
+            text="Flow: Diagnose -> Safe Repair -> Deep Repair Fallback (if needed) -> Verify",
+            style="CardBody.TLabel",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        self.auto_button = ttk.Button(
+            actions,
+            text="Auto Fix Everything",
+            style="Primary.TButton",
+            command=self._start_auto_fix,
         )
+        self.auto_button.grid(row=2, column=0, sticky="ew", padx=(0, 8))
 
-        self.quick_button = ttk.Button(actions, text="Quick Diagnose", style="Primary.TButton", command=self._run_quick_diagnose)
-        self.quick_button.grid(row=2, column=0, sticky="ew", padx=(0, 8))
-        self.safe_button = ttk.Button(actions, text="Safe Repair", style="Primary.TButton", command=self._run_safe_repair)
-        self.safe_button.grid(row=2, column=1, sticky="ew", padx=(0, 8))
-        self.deep_button = ttk.Button(actions, text="Deep Repair", style="Danger.TButton", command=self._run_deep_repair)
-        self.deep_button.grid(row=2, column=2, sticky="ew", padx=(0, 8))
-        self.custom_button = ttk.Button(actions, text="Run Custom", style="Ghost.TButton", command=self._run_custom)
-        self.custom_button.grid(row=2, column=3, sticky="ew", padx=(0, 8))
-        self.stop_button = ttk.Button(actions, text="Stop", style="Ghost.TButton", command=self._stop_current_task, state="disabled")
-        self.stop_button.grid(row=2, column=4, sticky="ew")
+        self.stop_button = ttk.Button(actions, text="Stop", style="Danger.TButton", command=self._stop_current_task, state="disabled")
+        self.stop_button.grid(row=2, column=1, sticky="ew")
 
         logs = ttk.Frame(root, style="Card.TFrame", padding=12)
         logs.grid(row=3, column=0, sticky="nsew")
         logs.columnconfigure(0, weight=1)
         logs.rowconfigure(2, weight=1)
-        self._card_border(logs)
 
         ttk.Label(logs, text="Live Logs", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
         tools = ttk.Frame(logs, style="Card.TFrame")
         tools.grid(row=1, column=0, sticky="ew", pady=(4, 8))
-        tools.columnconfigure(5, weight=1)
 
-        ttk.Button(tools, text="Clear", style="Ghost.TButton", command=self._clear_log).grid(row=0, column=0, padx=(0, 6))
-        ttk.Button(tools, text="Copy", style="Ghost.TButton", command=self._copy_log).grid(row=0, column=1, padx=(0, 6))
-        ttk.Button(tools, text="Save Log", style="Ghost.TButton", command=self._save_log).grid(row=0, column=2, padx=(0, 6))
-        ttk.Button(tools, text="Open Report", style="Ghost.TButton", command=self._open_last_report).grid(row=0, column=3, padx=(0, 6))
-        ttk.Button(tools, text="Open Backups", style="Ghost.TButton", command=self._open_backup_folder).grid(row=0, column=4)
+        ttk.Button(tools, text="Clear", style="Ghost.TButton", command=self._clear_log).pack(side="left", padx=(0, 6))
+        ttk.Button(tools, text="Copy", style="Ghost.TButton", command=self._copy_log).pack(side="left", padx=(0, 6))
+        ttk.Button(tools, text="Save Log", style="Ghost.TButton", command=self._save_log).pack(side="left", padx=(0, 6))
+        ttk.Button(tools, text="Open Report", style="Ghost.TButton", command=self._open_last_report).pack(side="left", padx=(0, 6))
+        ttk.Button(tools, text="Open Backups", style="Ghost.TButton", command=self._open_backup_folder).pack(side="left")
 
         log_wrap = tk.Frame(logs, bg=self.colors["surface"])
         log_wrap.grid(row=2, column=0, sticky="nsew")
@@ -297,125 +242,191 @@ class ToolFixUI(tk.Tk):
             padx=10,
         ).pack(fill="both", expand=True)
 
-        self._append_log(f"[{self._now()}] ToolFix UI ready.", "header")
+        self._append_log("[%s] ToolFix one-click UI ready." % self._now(), "header")
         if not self.fix_script.exists():
-            self._append_log(f"[{self._now()}] fix.py not found next to this file.", "error")
+            self._append_log("[%s] fix.py not found next to this file." % self._now(), "error")
             self.status_var.set("Error: fix.py not found")
-            self._set_buttons_enabled(False)
+            self._set_running_state(False, disabled_all=True)
 
-    def _card_border(self, frame: ttk.Frame) -> None:
-        frame.configure(style="Card.TFrame")
-        frame.update_idletasks()
-
-    def _detect_default_xampp(self) -> str:
+    def _detect_default_xampp(self):
         for path in (Path(r"C:\xampp"), Path(r"D:\xampp"), Path(r"E:\xampp")):
             if (path / "mysql").exists() and (path / "apache").exists():
                 return str(path)
         return r"C:\xampp"
 
-    def _browse_path(self) -> None:
+    def _browse_path(self):
         selected = filedialog.askdirectory(initialdir=self.path_var.get() or r"C:\\")
         if selected:
             self.path_var.set(selected)
 
-    def _run_quick_diagnose(self) -> None:
-        args = ["--yes", "--dry-run", "--mysql-repair-mode", "never"]
-        self._run_process(args, "Quick Diagnose")
-
-    def _run_safe_repair(self) -> None:
-        args = ["--yes", "--mysql-repair-mode", "auto"]
-        self._run_process(args, "Safe Repair")
-
-    def _run_deep_repair(self) -> None:
-        if not messagebox.askyesno(
-            "Deep Repair",
-            "Deep Repair may rebuild MySQL data folder structure.\nBackups are kept automatically.\nContinue?",
-            parent=self,
-        ):
-            return
-        args = ["--yes", "--mysql-repair-mode", "always"]
-        self._run_process(args, "Deep Repair")
-
-    def _run_custom(self) -> None:
-        args = ["--yes"]
-        if self.dry_run_var.get():
-            args.append("--dry-run")
-        if self.auto_kill_var.get():
-            args.append("--auto-kill")
-        if self.no_remap_var.get():
-            args.append("--no-port-remap")
-        if self.skip_apache_var.get():
-            args.append("--skip-apache")
-        if self.skip_mysql_var.get():
-            args.append("--skip-mysql")
-        args.extend(["--mysql-repair-mode", self.mode_var.get()])
-        self._run_process(args, "Custom Run")
-
-    def _run_process(self, extra_args: List[str], mode_name: str) -> None:
-        if self.proc is not None and self.proc.poll() is None:
-            messagebox.showwarning("Task Running", "Another task is already running.", parent=self)
+    def _start_auto_fix(self):
+        if self.worker_thread is not None and self.worker_thread.is_alive():
+            messagebox.showwarning("Task Running", "Auto-fix is already running.", parent=self)
             return
         if not self.fix_script.exists():
-            messagebox.showerror("Missing Script", f"Could not find: {self.fix_script}", parent=self)
+            messagebox.showerror("Missing Script", "Could not find fix.py", parent=self)
             return
 
-        command = [sys.executable, str(self.fix_script)]
         path_value = self.path_var.get().strip()
-        if path_value:
-            command.extend(["--xampp-path", path_value])
+        if not path_value:
+            messagebox.showwarning("Path Required", "Please set XAMPP path first.", parent=self)
+            return
+
+        self.stop_requested.clear()
+        self._set_running_state(True)
+        self.status_var.set("Auto-fix in progress...")
+        self._append_log("", "muted")
+        self._append_log("[%s] START: Smart auto-fix workflow" % self._now(), "header")
+        self.worker_thread = threading.Thread(target=self._auto_fix_workflow, daemon=True)
+        self.worker_thread.start()
+
+    def _auto_fix_workflow(self):
+        path_value = self.path_var.get().strip()
+        success = False
+        summary = "Unknown state."
+
+        try:
+            stages = [
+                ("Stage 1/4 - Diagnose", ["--yes", "--dry-run", "--mysql-repair-mode", "never"]),
+                ("Stage 2/4 - Safe Repair", ["--yes", "--auto-kill", "--mysql-repair-mode", "auto"]),
+            ]
+            for name, args in stages:
+                code = self._run_fix_stage(name, path_value, args)
+                if code != 0:
+                    summary = "Workflow stopped: %s failed (exit code %s)." % (name, code)
+                    self.log_queue.put(("done", False, summary))
+                    return
+                if self.stop_requested.is_set():
+                    summary = "Workflow stopped by user."
+                    self.log_queue.put(("done", False, summary))
+                    return
+
+            integrity = self._check_mysql_data_integrity(path_value)
+            if not integrity["ok"] and not self.stop_requested.is_set():
+                missing = integrity["missing"]
+                self.log_queue.put(("line", "[%s] Stage 3/4 - Fallback: Deep MySQL Repair (missing: %s)" % (
+                    self._now(),
+                    ", ".join(missing),
+                )))
+                code = self._run_fix_stage(
+                    "Stage 3/4 - Deep MySQL Repair",
+                    path_value,
+                    ["--yes", "--auto-kill", "--mysql-repair-mode", "always"],
+                )
+                if code != 0:
+                    summary = "Deep repair failed (exit code %s)." % code
+                    self.log_queue.put(("done", False, summary))
+                    return
+
+            code = self._run_fix_stage(
+                "Stage 4/4 - Final Verification",
+                path_value,
+                ["--yes", "--dry-run", "--mysql-repair-mode", "never"],
+            )
+            if code != 0:
+                summary = "Final verification failed."
+                self.log_queue.put(("done", False, summary))
+                return
+
+            if self.stop_requested.is_set():
+                summary = "Workflow stopped by user."
+                self.log_queue.put(("done", False, summary))
+                return
+
+            success = True
+            summary = "Auto-fix completed. Open XAMPP Control Panel and start Apache/MySQL."
+            self.log_queue.put(("done", success, summary))
+        except Exception as exc:
+            self.log_queue.put(("line", "[%s] Unexpected error: %s" % (self._now(), exc)))
+            self.log_queue.put(("done", False, "Workflow crashed with unexpected error."))
+
+    def _run_fix_stage(self, stage_name, xampp_path, extra_args):
+        command = [sys.executable, str(self.fix_script), "--xampp-path", xampp_path]
         command.extend(extra_args)
 
-        self._append_log("", "muted")
-        self._append_log(f"[{self._now()}] Running {mode_name}", "header")
-        self._append_log(" ".join(command), "muted")
+        self.log_queue.put(("line", "[%s] %s" % (self._now(), stage_name)))
+        self.log_queue.put(("line", " ".join(command)))
 
-        self._set_running_state(True)
-        self.status_var.set(f"{mode_name} in progress...")
-
-        self.proc = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            universal_newlines=True,
-        )
-        self.read_thread = threading.Thread(target=self._read_stdout, daemon=True)
-        self.read_thread.start()
-
-    def _read_stdout(self) -> None:
-        if self.proc is None or self.proc.stdout is None:
-            return
         try:
-            for line in self.proc.stdout:
-                self.log_queue.put(("line", line.rstrip("\n")))
-        finally:
-            returncode = self.proc.wait()
-            self.log_queue.put(("done", str(returncode)))
+            self.proc = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True,
+            )
+        except Exception as exc:
+            self.log_queue.put(("line", "[%s] Could not start fix.py: %s" % (self._now(), exc)))
+            return 1
 
-    def _drain_log_queue(self) -> None:
+        if self.proc.stdout is not None:
+            for line in self.proc.stdout:
+                if self.stop_requested.is_set():
+                    break
+                self.log_queue.put(("line", line.rstrip("\n")))
+
+        if self.stop_requested.is_set() and self.proc.poll() is None:
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+
+        code = self.proc.wait()
+        self.proc = None
+        self.log_queue.put(("line", "[%s] %s finished with exit code %s" % (self._now(), stage_name, code)))
+        return code
+
+    def _check_mysql_data_integrity(self, xampp_path):
+        state = {"ok": True, "missing": []}
+        if fix_core is None:
+            self.log_queue.put(("line", "[%s] Integrity check warning: fix.py module import failed." % self._now()))
+            return state
+
+        try:
+            root = fix_core.find_xampp_root(xampp_path)
+            ctx = fix_core.build_context(root, dry_run=True)
+            ok, missing = fix_core.mysql_data_structure_status(ctx.mysql_data)
+            state["ok"] = ok
+            state["missing"] = missing
+            return state
+        except Exception as exc:
+            self.log_queue.put(("line", "[%s] Integrity check error: %s" % (self._now(), exc)))
+            return state
+
+    def _stop_current_task(self):
+        self.stop_requested.set()
+        if self.proc is not None and self.proc.poll() is None:
+            try:
+                self.proc.terminate()
+                self._append_log("[%s] Stop requested..." % self._now(), "warn")
+            except Exception as exc:
+                self._append_log("[%s] Failed to stop process: %s" % (self._now(), exc), "error")
+        self.status_var.set("Stopping workflow...")
+
+    def _drain_log_queue(self):
         try:
             while True:
-                kind, value = self.log_queue.get_nowait()
+                item = self.log_queue.get_nowait()
+                kind = item[0]
                 if kind == "line":
-                    self._consume_process_line(value)
+                    self._consume_process_line(item[1])
                 elif kind == "done":
-                    code = int(value)
-                    self._on_process_done(code)
+                    self._on_workflow_done(item[1], item[2])
         except queue.Empty:
             pass
         self.after(120, self._drain_log_queue)
 
-    def _consume_process_line(self, line: str) -> None:
+    def _consume_process_line(self, line):
         tag = "muted"
         lowered = line.lower()
-        if "[error]" in lowered or "failed" in lowered:
+        if "[error]" in lowered or "failed" in lowered or "unexpected error" in lowered:
             tag = "error"
-        elif "warning" in lowered or "conflict" in lowered:
+        elif "warning" in lowered or "conflict" in lowered or "timed out" in lowered:
             tag = "warn"
-        elif "completed" in lowered or "saved" in lowered or "free." in lowered:
+        elif "completed" in lowered or "saved" in lowered or "running" in lowered:
             tag = "success"
-        elif line.startswith("===") or line.startswith("[MySQL]") or line.startswith("[Apache]"):
+        elif line.startswith("===") or line.startswith("[MySQL]") or line.startswith("[Apache]") or "stage " in lowered:
             tag = "header"
 
         if line.strip().startswith("Report saved:"):
@@ -424,61 +435,51 @@ class ToolFixUI(tk.Tk):
 
         self._append_log(line, tag)
 
-    def _on_process_done(self, returncode: int) -> None:
-        if returncode == 0:
-            self.status_var.set("Completed successfully")
-            self._append_log(f"[{self._now()}] Task completed.", "success")
-        else:
-            self.status_var.set(f"Exited with code {returncode}")
-            self._append_log(f"[{self._now()}] Task failed with exit code {returncode}.", "error")
-
-        self._set_running_state(False)
+    def _on_workflow_done(self, success, summary):
         self.proc = None
-        self.read_thread = None
+        self.worker_thread = None
+        self._set_running_state(False)
+        self.status_var.set(summary)
+        if success:
+            self._append_log("[%s] DONE: %s" % (self._now(), summary), "success")
+        else:
+            self._append_log("[%s] STOPPED: %s" % (self._now(), summary), "error")
 
-    def _stop_current_task(self) -> None:
-        if self.proc is None or self.proc.poll() is not None:
+    def _set_running_state(self, running, disabled_all=False):
+        if disabled_all:
+            self.auto_button.configure(state="disabled")
+            self.stop_button.configure(state="disabled")
+            self.path_entry.configure(state="disabled")
+            self.browse_button.configure(state="disabled")
             return
-        try:
-            self.proc.terminate()
-            self._append_log(f"[{self._now()}] Stop requested...", "warn")
-            self.status_var.set("Stopping task...")
-        except Exception as exc:
-            self._append_log(f"[{self._now()}] Failed to stop process: {exc}", "error")
 
-    def _set_running_state(self, running: bool) -> None:
-        run_state = "disabled" if running else "normal"
-        stop_state = "normal" if running else "disabled"
-        self.quick_button.configure(state=run_state)
-        self.safe_button.configure(state=run_state)
-        self.deep_button.configure(state=run_state)
-        self.custom_button.configure(state=run_state)
-        self.stop_button.configure(state=stop_state)
+        if running:
+            self.auto_button.configure(state="disabled")
+            self.stop_button.configure(state="normal")
+            self.path_entry.configure(state="disabled")
+            self.browse_button.configure(state="disabled")
+        else:
+            self.auto_button.configure(state="normal")
+            self.stop_button.configure(state="disabled")
+            self.path_entry.configure(state="normal")
+            self.browse_button.configure(state="normal")
 
-    def _set_buttons_enabled(self, enabled: bool) -> None:
-        state = "normal" if enabled else "disabled"
-        self.quick_button.configure(state=state)
-        self.safe_button.configure(state=state)
-        self.deep_button.configure(state=state)
-        self.custom_button.configure(state=state)
-        self.stop_button.configure(state="disabled")
-
-    def _append_log(self, message: str, tag: str = "muted") -> None:
+    def _append_log(self, message, tag="muted"):
         self.log_text.insert("end", message + "\n", tag)
         self.log_text.see("end")
 
-    def _clear_log(self) -> None:
+    def _clear_log(self):
         self.log_text.delete("1.0", "end")
-        self._append_log(f"[{self._now()}] Log cleared.", "muted")
+        self._append_log("[%s] Log cleared." % self._now(), "muted")
 
-    def _copy_log(self) -> None:
+    def _copy_log(self):
         text = self.log_text.get("1.0", "end-1c")
         self.clipboard_clear()
         self.clipboard_append(text)
         self.status_var.set("Log copied to clipboard")
 
-    def _save_log(self) -> None:
-        initial_name = f"toolfix_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    def _save_log(self):
+        initial_name = "toolfix_log_%s.txt" % datetime.now().strftime("%Y%m%d_%H%M%S")
         output_file = filedialog.asksaveasfilename(
             title="Save Log",
             defaultextension=".txt",
@@ -488,15 +489,15 @@ class ToolFixUI(tk.Tk):
         if not output_file:
             return
         Path(output_file).write_text(self.log_text.get("1.0", "end-1c"), encoding="utf-8")
-        self.status_var.set(f"Log saved: {output_file}")
+        self.status_var.set("Log saved: %s" % output_file)
 
-    def _open_last_report(self) -> None:
+    def _open_last_report(self):
         if self.last_report_path and self.last_report_path.exists():
             self._open_path(self.last_report_path)
             return
-        messagebox.showinfo("No Report", "No report found yet. Run a task first.", parent=self)
+        messagebox.showinfo("No Report", "No report found yet. Run auto-fix first.", parent=self)
 
-    def _open_backup_folder(self) -> None:
+    def _open_backup_folder(self):
         path_value = self.path_var.get().strip()
         if not path_value:
             messagebox.showinfo("Path Required", "Set XAMPP path first.", parent=self)
@@ -505,32 +506,32 @@ class ToolFixUI(tk.Tk):
         if backup_dir.exists():
             self._open_path(backup_dir)
             return
-        messagebox.showinfo("No Backup Folder", f"Not found: {backup_dir}", parent=self)
+        messagebox.showinfo("No Backup Folder", "Not found: %s" % backup_dir, parent=self)
 
-    def _open_path(self, path: Path) -> None:
+    def _open_path(self, path):
         try:
             if sys.platform.startswith("win"):
-                os.startfile(str(path))  # type: ignore[attr-defined]
+                os.startfile(str(path))
             elif sys.platform == "darwin":
                 subprocess.Popen(["open", str(path)])
             else:
                 subprocess.Popen(["xdg-open", str(path)])
         except Exception as exc:
-            messagebox.showerror("Open Failed", f"Could not open path:\n{path}\n\n{exc}", parent=self)
+            messagebox.showerror("Open Failed", "Could not open path:\n%s\n\n%s" % (path, exc), parent=self)
 
-    def _on_close(self) -> None:
-        if self.proc is not None and self.proc.poll() is None:
-            if not messagebox.askyesno("Exit", "A task is still running. Stop and exit?", parent=self):
+    def _on_close(self):
+        if self.worker_thread is not None and self.worker_thread.is_alive():
+            if not messagebox.askyesno("Exit", "Auto-fix is still running. Stop and exit?", parent=self):
                 return
             self._stop_current_task()
         self.destroy()
 
     @staticmethod
-    def _now() -> str:
+    def _now():
         return datetime.now().strftime("%H:%M:%S")
 
 
-def main() -> None:
+def main():
     app = ToolFixUI()
     app.mainloop()
 
