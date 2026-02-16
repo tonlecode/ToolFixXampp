@@ -3,6 +3,7 @@ import queue
 import subprocess
 import sys
 import threading
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox
@@ -13,6 +14,25 @@ try:
     import fix as fix_core
 except Exception:
     fix_core = None
+
+
+class QueueLogWriter:
+    def __init__(self, put_line_callback):
+        self.put_line_callback = put_line_callback
+        self._buffer = ""
+
+    def write(self, text):
+        if not text:
+            return
+        self._buffer += text
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            self.put_line_callback(line.rstrip("\r"))
+
+    def flush(self):
+        if self._buffer:
+            self.put_line_callback(self._buffer.rstrip("\r"))
+            self._buffer = ""
 
 
 class ToolFixUI(tk.Tk):
@@ -243,9 +263,13 @@ class ToolFixUI(tk.Tk):
         ).pack(fill="both", expand=True)
 
         self._append_log("[%s] ToolFix one-click UI ready." % self._now(), "header")
-        if not self.fix_script.exists():
+        if not self.fix_script.exists() and not getattr(sys, "frozen", False):
             self._append_log("[%s] fix.py not found next to this file." % self._now(), "error")
             self.status_var.set("Error: fix.py not found")
+            self._set_running_state(False, disabled_all=True)
+        elif getattr(sys, "frozen", False) and fix_core is None:
+            self._append_log("[%s] Embedded repair engine not available in EXE." % self._now(), "error")
+            self.status_var.set("Error: embedded repair engine missing")
             self._set_running_state(False, disabled_all=True)
 
     def _detect_default_xampp(self):
@@ -263,8 +287,11 @@ class ToolFixUI(tk.Tk):
         if self.worker_thread is not None and self.worker_thread.is_alive():
             messagebox.showwarning("Task Running", "Auto-fix is already running.", parent=self)
             return
-        if not self.fix_script.exists():
+        if not self.fix_script.exists() and not getattr(sys, "frozen", False):
             messagebox.showerror("Missing Script", "Could not find fix.py", parent=self)
+            return
+        if getattr(sys, "frozen", False) and fix_core is None:
+            messagebox.showerror("Repair Engine Missing", "Embedded fix engine is not available in this EXE.", parent=self)
             return
 
         path_value = self.path_var.get().strip()
@@ -341,6 +368,9 @@ class ToolFixUI(tk.Tk):
             self.log_queue.put(("done", False, "Workflow crashed with unexpected error."))
 
     def _run_fix_stage(self, stage_name, xampp_path, extra_args):
+        if getattr(sys, "frozen", False):
+            return self._run_fix_stage_embedded(stage_name, xampp_path, extra_args)
+
         command = [sys.executable, str(self.fix_script), "--xampp-path", xampp_path]
         command.extend(extra_args)
 
@@ -377,6 +407,34 @@ class ToolFixUI(tk.Tk):
         self.log_queue.put(("line", "[%s] %s finished with exit code %s" % (self._now(), stage_name, code)))
         return code
 
+    def _run_fix_stage_embedded(self, stage_name, xampp_path, extra_args):
+        if fix_core is None:
+            self.log_queue.put(("line", "[%s] fix.py module import failed in embedded mode." % self._now()))
+            return 1
+
+        args = ["fix.py", "--xampp-path", xampp_path]
+        args.extend(extra_args)
+        self.log_queue.put(("line", "[%s] %s (embedded mode)" % (self._now(), stage_name)))
+        self.log_queue.put(("line", " ".join(args)))
+
+        old_argv = list(sys.argv)
+        writer = QueueLogWriter(lambda ln: self.log_queue.put(("line", ln)))
+        code = 1
+        try:
+            sys.argv = args
+            with redirect_stdout(writer), redirect_stderr(writer):
+                result = fix_core.main()
+            code = int(result) if isinstance(result, int) else 0
+        except Exception as exc:
+            self.log_queue.put(("line", "[%s] Embedded stage failed: %s" % (self._now(), exc)))
+            code = 1
+        finally:
+            writer.flush()
+            sys.argv = old_argv
+
+        self.log_queue.put(("line", "[%s] %s finished with exit code %s" % (self._now(), stage_name, code)))
+        return code
+
     def _check_mysql_data_integrity(self, xampp_path):
         state = {"ok": True, "missing": []}
         if fix_core is None:
@@ -402,6 +460,8 @@ class ToolFixUI(tk.Tk):
                 self._append_log("[%s] Stop requested..." % self._now(), "warn")
             except Exception as exc:
                 self._append_log("[%s] Failed to stop process: %s" % (self._now(), exc), "error")
+        elif getattr(sys, "frozen", False):
+            self._append_log("[%s] Stop requested. Waiting for current embedded stage to finish..." % self._now(), "warn")
         self.status_var.set("Stopping workflow...")
 
     def _drain_log_queue(self):
